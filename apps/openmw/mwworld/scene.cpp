@@ -3,6 +3,8 @@
 #include <limits>
 #include <iostream>
 
+#include <osg/Timer>
+
 #include <components/loadinglistener/loadinglistener.hpp>
 #include <components/misc/resourcehelpers.hpp>
 #include <components/settings/settings.hpp>
@@ -205,7 +207,7 @@ namespace MWWorld
 
     void Scene::unloadCell (CellStoreCollection::iterator iter)
     {
-        std::cout << "Unloading cell\n";
+        osg::ElapsedTime timer;
         ListAndResetObjectsVisitor visitor;
 
         (*iter)->forEach<ListAndResetObjectsVisitor>(visitor);
@@ -215,15 +217,18 @@ namespace MWWorld
             mPhysics->remove(*iter2);
         }
 
-        if ((*iter)->getCell()->isExterior())
+        const ESM::Cell* cell = (*iter)->getCell();
+        std::string cellName = "'" + cell->mName + "'";
+        if (cell->isExterior())
         {
+            cellName = "(" + cell->getDescription() + ")";
             ESM::Land* land =
                 MWBase::Environment::get().getWorld()->getStore().get<ESM::Land>().search(
-                    (*iter)->getCell()->getGridX(),
-                    (*iter)->getCell()->getGridY()
+                    cell->getGridX(),
+                    cell->getGridY()
                 );
             if (land && land->mDataTypes&ESM::Land::DATA_VHGT)
-                mPhysics->removeHeightField ((*iter)->getCell()->getGridX(), (*iter)->getCell()->getGridY());
+                mPhysics->removeHeightField (cell->getGridX(), cell->getGridY());
         }
 
         MWBase::Environment::get().getMechanicsManager()->drop (*iter);
@@ -234,6 +239,8 @@ namespace MWWorld
         MWBase::Environment::get().getWorld()->getLocalScripts().clearCell (*iter);
 
         MWBase::Environment::get().getSoundManager()->stopSound (*iter);
+
+        std::cout << "Unloaded cell " << cellName << " in " << timer.elapsedTime_m() << " milliseconds." << std::endl;
         mActiveCells.erase(*iter);
     }
 
@@ -243,14 +250,16 @@ namespace MWWorld
 
         if(result.second)
         {
-            std::cout << "Loading cell " << cell->getCell()->getDescription() << std::endl;
-
+            osg::ElapsedTime timer;
             float verts = ESM::Land::LAND_SIZE;
             float worldsize = ESM::Land::REAL_SIZE;
 
+            std::string cellName = "'" + cell->getCell()->mName + "'";
             // Load terrain physics first...
+            // Loading terrain typically takes ~0.04ms, range 0.02-0.06ms.
             if (cell->getCell()->isExterior())
             {
+                cellName = "(" + cell->getCell()->getDescription() + ")";
                 ESM::Land* land =
                     MWBase::Environment::get().getWorld()->getStore().get<ESM::Land>().search(
                         cell->getCell()->getGridX(),
@@ -267,13 +276,17 @@ namespace MWWorld
                 }
             }
 
+            // Respawning typically takes 0.001-0.003ms, but there's a long tail up to 0.04ms.
             cell->respawn();
 
             // ... then references. This is important for adjustPosition to work correctly.
             /// \todo rescale depending on the state of a new GMST
             insertCell (*cell, true, loadingListener);
 
+            // Typically takes 0.8-1.4 milliseconds.
             mRendering.addCell(cell);
+
+            // Physics typically takes ~0.003ms, Cell (-10-8) takes five times as long!
             bool waterEnabled = cell->getCell()->hasWater() || cell->isExterior();
             float waterLevel = cell->getWaterLevel();
             mRendering.setWaterEnabled(waterEnabled);
@@ -287,6 +300,9 @@ namespace MWWorld
 
             if (!cell->isExterior() && !(cell->getCell()->mData.mFlags & ESM::Cell::QuasiEx))
                 mRendering.configureAmbient(cell->getCell());
+
+            std::cout << "Loaded cell " << cellName
+                      << " in " << timer.elapsedTime_m() << " milliseconds." << std::endl;
         }
 
         // register local scripts
@@ -319,7 +335,10 @@ namespace MWWorld
         {
             int newX, newY;
             MWBase::Environment::get().getWorld()->positionToIndex(pos.x(), pos.y(), newX, newY);
+            std::cout << "Crossing cell boundary..." << std::endl;
+            osg::ElapsedTime timer;
             changeCellGrid(newX, newY);
+            std::cout << "Total cell boundary time was " << timer.elapsedTime_m() << " milliseconds." << std::endl;
             //mRendering.updateTerrain();
         }
     }
@@ -498,7 +517,8 @@ namespace MWWorld
             return;
         }
 
-        std::cout << "Changing to interior\n";
+        osg::ElapsedTime timer;
+        std::cout << "Changing to interior." << std::endl;
 
         // unload
         int current = 0;
@@ -530,6 +550,7 @@ namespace MWWorld
         // Delay the map update until scripts have been given a chance to run.
         // If we don't do this, objects that should be disabled will still appear on the map.
         mNeedMapUpdate = true;
+        std::cout << "Interior change time was " <<  timer.elapsedTime_m() << " milliseconds." << std::endl;
 
         mRendering.getResourceSystem()->clearCache();
     }
@@ -539,12 +560,17 @@ namespace MWWorld
         int x = 0;
         int y = 0;
 
+        osg::ElapsedTime timer;
+        std::cout << "Changing to exterior." << std::endl;
+
         MWBase::Environment::get().getWorld()->positionToIndex (position.pos[0], position.pos[1], x, y);
 
         changeCellGrid(x, y);
 
         CellStore* current = MWBase::Environment::get().getWorld()->getExterior(x, y);
         changePlayerCell(current, position, adjustPlayerPos);
+
+        std::cout << "Total exterior change time was " <<  timer.elapsedTime_m() << " milliseconds." << std::endl;
 
         //mRendering.updateTerrain();
     }
@@ -565,6 +591,8 @@ namespace MWWorld
         cell.forEach (insertVisitor);
 
         // do adjustPosition (snapping actors to ground) after objects are loaded, so we don't depend on the loading order
+        // Typically takes 0.0-0.08ms.
+        osg::ElapsedTime atimer;
         AdjustPositionVisitor adjustPosVisitor;
         cell.forEach (adjustPosVisitor);
     }
