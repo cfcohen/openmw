@@ -1,6 +1,10 @@
+#include <iostream>
+
 #include "camera.hpp"
 
 #include <osg/Camera>
+#include <osg/View>
+#include <osg/RenderInfo>
 
 #include <components/sceneutil/positionattitudetransform.hpp>
 
@@ -11,6 +15,20 @@
 #include "../mwworld/refdata.hpp"
 
 #include "npcanimation.hpp"
+
+// NVidia GL_NVX_gpu_memory_info interface
+// https://www.opengl.org/registry/specs/NVX/gpu_memory_info.txt
+#define GPU_MEMORY_INFO_DEDICATED_VIDMEM_NVX          0x9047
+#define GPU_MEMORY_INFO_TOTAL_AVAILABLE_MEMORY_NVX    0x9048
+#define GPU_MEMORY_INFO_CURRENT_AVAILABLE_VIDMEM_NVX  0x9049
+#define GPU_MEMORY_INFO_EVICTION_COUNT_NVX            0x904A
+#define GPU_MEMORY_INFO_EVICTED_MEMORY_NVX            0x904B
+
+// AMD GL_ATI_meminfo interface
+// https://www.opengl.org/registry/specs/ATI/meminfo.txt
+#define VBO_FREE_MEMORY_ATI                           0x87FB
+#define TEXTURE_FREE_MEMORY_ATI                       0x87FC
+#define RENDERBUFFER_FREE_MEMORY_ATI                  0x87FD
 
 namespace
 {
@@ -35,6 +53,128 @@ public:
 
 private:
     MWRender::Camera* mCamera;
+};
+
+class MemoryInfoCallback : public osg::Camera::DrawCallback
+{
+private:
+    enum ExtensionType {
+        NONE,
+        NVIDIA,
+        AMD
+    };
+
+    // Which extension is being used?
+    ExtensionType mExtension;
+
+public:
+
+    MemoryInfoCallback()
+        : osg::Camera::DrawCallback()
+        , mExtension(NONE)
+    {
+    }
+
+    MemoryInfoCallback(osg::ref_ptr<osg::Camera> camera)
+        : osg::Camera::DrawCallback()
+        , mExtension(NONE)
+    {
+        // Initialize the memory statistics.
+        osg::ref_ptr<osg::View> view = camera->getView();
+        osg::Stats* stats = view->getStats();
+        stats->setAttribute(0, "Texture memory", 0.0);
+
+        osg::ref_ptr<osg::GraphicsContext> context = camera->getGraphicsContext();
+        osg::ref_ptr<osg::State> state = context->getState();
+        unsigned int contextID = state->getContextID();
+
+        // Determine whether the required extensions are supported.
+        if (osg::isGLExtensionSupported(contextID, "GL_NVX_gpu_memory_info")) {
+            mExtension = NVIDIA;
+        }
+        else if (osg::isGLExtensionSupported(contextID, "GL_ATI_meminfo")) {
+            mExtension = AMD;
+            std::cout << "AMD GL_ATI_meminfo support is completely untested!" << std::endl;
+        }
+    }
+
+    MemoryInfoCallback(const MemoryInfoCallback& copy, const osg::CopyOp& copyop)
+        : osg::Camera::DrawCallback(copy, copyop)
+        , mExtension(copy.mExtension)
+    {
+    }
+
+    META_Object(OpenMW, MemoryInfoCallback)
+
+    void operator()(osg::RenderInfo& renderInfo) const
+    {
+        if (mExtension == NONE) return;
+
+        osg::ref_ptr<osg::View> view = renderInfo.getView();
+        osg::Stats* stats = view->getStats();
+        bool collecting = stats->collectStats("frame_rate");
+        if (!collecting) return;
+
+        osg::FrameStamp* frameStamp = view->getFrameStamp();
+        int frameNumber = frameStamp->getFrameNumber();
+
+        if (mExtension == NVIDIA) {
+            // Dedicated and total appear to return the same numbers.
+            GLint dedicated;
+            glGetIntegerv(GPU_MEMORY_INFO_DEDICATED_VIDMEM_NVX, &dedicated);
+            GLint total;
+            glGetIntegerv(GPU_MEMORY_INFO_TOTAL_AVAILABLE_MEMORY_NVX, &total);
+            GLint available;
+            glGetIntegerv(GPU_MEMORY_INFO_CURRENT_AVAILABLE_VIDMEM_NVX, &available);
+            GLint evictionCount;
+            glGetIntegerv(GPU_MEMORY_INFO_EVICTION_COUNT_NVX, &evictionCount);
+            GLint evictedMemory;
+            glGetIntegerv(GPU_MEMORY_INFO_EVICTED_MEMORY_NVX, &evictedMemory);
+
+            // Set the statistic in the view Stats object (requires modified OSG to display on screen).
+            float mem_kb = available;
+            stats->setAttribute(frameNumber, "Texture memory", mem_kb);
+
+            // Occasional reporting for people without the modified version of OSG.
+            if (frameNumber % 500 == 0) {
+                std::cout << "Available video memory: dedicated=" << dedicated
+                          << " total=" << total
+                          << " available=" << available
+                          << " ecount=" << evictionCount
+                          << " ememory=" << evictedMemory << std::endl;
+            }
+        }
+        else if (mExtension == AMD) {
+            // The other two API parameters (VBO_FREE_MEMORY_ATI and RENDERBUFFER_FREE_MEMORY_ATI)
+            // are reported to to return the same values as TEXTURE_FREE_MEMORY_ATI.  Presumably
+            // modern cards don't differentiate in the same way that older cards did.
+            GLint freeMem[4] = { 0, 0, 0, 0 };
+            glGetIntegerv(TEXTURE_FREE_MEMORY_ATI, &freeMem[0]);
+
+#if 0
+            // Annoyingly, the total amount of video memory is available from a different extension,
+            // that appears to be unsupported on Linux. :-(
+            GLuint uNoOfGPUs = wglGetGPUIDsAMD(0, 0);
+            GLuint* uGPUIDs = new GLuint[uNoOfGPUs];
+            wglGetGPUIDsAMD(uNoOfGPUs, uGPUIDs);
+            GLuint uTotalMemoryInMB = 0;
+            wglGetGPUInfoAMD(uGPUIDs[0], WGL_GPU_RAM_AMD, GL_UNSIGNED_INT,
+                             sizeof(GLuint), &uTotalMemoryInMB);
+#endif
+
+            // Set the statistic in the view Stats object (requires modified OSG to display on screen).
+            float mem_kb = (float) freeMem[0];
+            stats->setAttribute(frameNumber, "Texture memory", mem_kb);
+
+            // Occasional reporting for people without the modified version of OSG.
+            if (frameNumber % 500 == 0) {
+                std::cout << "Available video memory: available=" << freeMem[0]
+                          << " largest=" << freeMem[1]
+                          << " Auxiliary (swap?) available=" << freeMem[2]
+                          << " largest=" << freeMem[3] << std::endl;
+            }
+        }
+    }
 };
 
 }
@@ -71,6 +211,11 @@ namespace MWRender
 
         mUpdateCallback = new UpdateRenderCameraCallback(this);
         mCamera->addUpdateCallback(mUpdateCallback);
+
+        // InitialDrawCallback is used for loading screens.
+        // FinlDrawCallback is used for screenshots, but not on this camera.
+        osg::ref_ptr<MemoryInfoCallback> memoryInfoCallback = new MemoryInfoCallback(mCamera);
+        mCamera->setFinalDrawCallback(memoryInfoCallback);
     }
 
     Camera::~Camera()
